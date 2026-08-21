@@ -25,7 +25,7 @@ def research_clearance_risk(mention: str) -> str:
     """
     client = Parallel(api_key=PARALLEL_API_KEY)
 
-    result = client.beta.search(
+    search = client.search(
         objective=(
             f"Find information about trademark, licensing, or clearance "
             f"issues related to using '{mention}' in a film or TV script. "
@@ -33,11 +33,16 @@ def research_clearance_risk(mention: str) -> str:
         ),
         search_queries=[
             f"{mention} trademark film clearance lawsuit",
-            f"{mention} licensing requirements film TV use",
+            f"{mention} licensing requirements film TV",
         ],
-        max_results=5,
     )
-    return result
+
+    findings = []
+    for result in search.results:
+        findings.append(f"Source: {result.title} ({result.url})")
+        for excerpt in result.excerpts:
+            findings.append(f"  - {excerpt[:300]}")
+    return "\n".join(findings)
 
 # --- Step 2: Gemini synthesis call --------------------------------------
 
@@ -62,7 +67,7 @@ Write a short risk note (3-5 sentences) covering:
 """
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
     )
     return response.text
