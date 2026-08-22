@@ -1,12 +1,14 @@
 """
-Rights & Clearance Pre-Check — Day 1 smoke test.
+Rights & Clearance Pre-Check — Day 2.
 
-Goal: prove Parallel (research) -> Gemini (synthesis) pipeline works.
-Nothing fancy yet. Hardcoded test input. Just confirm both APIs respond
-and that we can pass Parallel's output into Gemini as context.
+Day 1 proved the Parallel -> Gemini pipeline works for one hardcoded mention.
+Day 2 goal: take a real script snippet, have Gemini extract the clearance-
+relevant mentions itself, then run each one through the pipeline and produce
+one combined report.
 """
 
 import os
+import time
 from dotenv import load_dotenv
 from parallel import Parallel
 from google import genai
@@ -15,6 +17,24 @@ load_dotenv()
 
 PARALLEL_API_KEY = os.environ["PARALLEL_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+
+def call_gemini_with_retry(client, model: str, prompt: str, max_attempts: int = 3):
+    """
+    Wraps a Gemini generate_content call with retry + backoff.
+    We're seeing intermittent forcibly-closed connections on rapid
+    back-to-back calls, so retry with a short pause rather than crashing
+    the whole run over a transient network blip.
+    """
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.models.generate_content(model=model, contents=prompt)
+        except Exception as e:
+            last_error = e
+            print(f"  (Gemini call failed, attempt {attempt}/{max_attempts}: {e})")
+            time.sleep(2 * attempt)  # 2s, 4s, 6s backoff
+    raise last_error
 
 # --- Step 1: Parallel research call -----------------------------------
 
@@ -25,6 +45,9 @@ def research_clearance_risk(mention: str) -> str:
     """
     client = Parallel(api_key=PARALLEL_API_KEY)
 
+    # Correct call shape per Parallel docs: client.search(...) is top-level,
+    # not client.beta.search(...). objective = natural-language goal,
+    # search_queries = 2-3 short keyword queries (no full sentences).
     search = client.search(
         objective=(
             f"Find information about trademark, licensing, or clearance "
@@ -37,12 +60,51 @@ def research_clearance_risk(mention: str) -> str:
         ],
     )
 
+    # Flatten results into a plain-text block we can hand to Gemini.
     findings = []
     for result in search.results:
         findings.append(f"Source: {result.title} ({result.url})")
         for excerpt in result.excerpts:
             findings.append(f"  - {excerpt[:300]}")
     return "\n".join(findings)
+
+# --- Step 1.5: Gemini extraction call -----------------------------------
+
+def extract_mentions(script_text: str) -> list[str]:
+    """
+    Ask Gemini to read a script snippet and pull out anything that might
+    need clearance: real brands/products, real people, song titles, or
+    specific real-world locations. Returns a plain list of short strings.
+    """
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    prompt = f"""You are helping a production legal team scan a script for
+anything that might need rights clearance before filming or release.
+
+Read the script snippet below and list every real-world brand, product,
+song title, real person's name, or specific real location mentioned.
+Ignore generic/fictional things (e.g. "a phone", "a coffee shop") -
+only list SPECIFIC real-world things that would need clearance.
+
+Script snippet:
+{script_text}
+
+Respond with ONLY a plain list, one item per line, nothing else.
+If nothing needs clearance, respond with exactly: NONE
+"""
+
+    response = call_gemini_with_retry(client, "gemini-3.6-flash", prompt)
+    text = response.text.strip()
+    if text == "NONE" or not text:
+        return []
+
+    # Split into lines, strip bullets/numbering Gemini might add anyway.
+    mentions = []
+    for line in text.splitlines():
+        cleaned = line.strip().lstrip("-*0123456789. ").strip()
+        if cleaned:
+            mentions.append(cleaned)
+    return mentions
 
 # --- Step 2: Gemini synthesis call --------------------------------------
 
@@ -66,23 +128,52 @@ Write a short risk note (3-5 sentences) covering:
 3. A recommended next step (e.g. "consult legal", "likely fine to use", "seek licensing")
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt,
-    )
+    response = call_gemini_with_retry(client, "gemini-3.6-flash", prompt)
     return response.text
 
-# --- Smoke test ----------------------------------------------------------
+# --- Sample script snippet (swap this for a real one later) -------------
+
+SAMPLE_SCRIPT = """
+INT. COFFEE SHOP - DAY
+
+MAYA sits at a corner table, scrolling on her iPhone. She's playing
+"Bohemian Rhapsody" through her earbuds, loud enough that JAKE can hear
+it from across the room.
+
+JAKE
+Is that Queen? Nice.
+
+MAYA
+(not looking up)
+Yeah. Anyway - did you see what Elon Musk tweeted this morning?
+
+She takes a sip from a Starbucks cup.
+"""
+
+# --- Main pipeline --------------------------------------------------------
 
 if __name__ == "__main__":
-    test_mention = "iPhone"  # swap this for anything - a brand, song title, real person's name
+    print("[1/3] Extracting clearance-relevant mentions from script...\n")
+    mentions = extract_mentions(SAMPLE_SCRIPT)
 
-    print(f"\n[1/2] Researching clearance risk for: '{test_mention}'...\n")
-    findings = research_clearance_risk(test_mention)
-    print("Parallel raw findings:")
-    print(findings)
+    if not mentions:
+        print("No clearance-relevant mentions found.")
+    else:
+        print(f"Found {len(mentions)} mention(s): {mentions}\n")
 
-    print(f"\n[2/2] Asking Gemini to synthesize a risk note...\n")
-    risk_note = summarize_risk(test_mention, findings)
-    print("Gemini risk note:")
-    print(risk_note)
+        report = []
+        for i, mention in enumerate(mentions, start=1):
+            print(f"[2/3] ({i}/{len(mentions)}) Researching: '{mention}'...")
+            findings = research_clearance_risk(mention)
+
+            print(f"[3/3] ({i}/{len(mentions)}) Synthesizing risk note for: '{mention}'...\n")
+            risk_note = summarize_risk(mention, findings)
+
+            report.append(f"=== {mention} ===\n{risk_note}\n")
+
+            time.sleep(1)  # brief pause between mentions to avoid rapid-fire connection issues
+
+        print("\n" + "=" * 60)
+        print("CLEARANCE PRE-CHECK REPORT")
+        print("=" * 60 + "\n")
+        print("\n".join(report))
