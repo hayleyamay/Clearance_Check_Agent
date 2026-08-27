@@ -8,8 +8,11 @@ one combined report.
 """
 
 import os
+import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Semaphore
 from dotenv import load_dotenv
 from parallel import Parallel
 from google import genai
@@ -19,27 +22,58 @@ load_dotenv()
 PARALLEL_API_KEY = os.environ["PARALLEL_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# How many mentions to process at once. Higher = faster but more load on
-# both APIs (and more chance of hitting the McAfee interception issue on
-# many simultaneous connections) - 3 is a reasonable balance.
-MAX_CONCURRENT_MENTIONS = 3
+# How many mentions to process at once. Kept low because the Gemini free
+# tier only allows 5 requests/minute for this model - going higher just
+# means more threads sitting in retry/backoff waiting on quota anyway.
+MAX_CONCURRENT_MENTIONS = 2
+
+# Gemini free tier is 5 req/min = roughly 1 request every 12s to stay safe.
+# This semaphore-based pacer makes every Gemini call (across all threads)
+# wait its turn rather than bursting and immediately hitting 429s.
+_gemini_pace_lock = Semaphore(1)
+_last_gemini_call_time = [0.0]
+MIN_SECONDS_BETWEEN_GEMINI_CALLS = 13
+
+
+def _wait_for_gemini_turn():
+    """
+    Global pacer shared across all threads: ensures we never call Gemini
+    more often than MIN_SECONDS_BETWEEN_GEMINI_CALLS, no matter how many
+    threads are trying to call it at once. This keeps us under the free
+    tier's 5-requests-per-minute quota instead of bursting and hitting 429s.
+    """
+    with _gemini_pace_lock:
+        now = time.time()
+        elapsed = now - _last_gemini_call_time[0]
+        if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
+            time.sleep(MIN_SECONDS_BETWEEN_GEMINI_CALLS - elapsed)
+        _last_gemini_call_time[0] = time.time()
 
 
 def call_gemini_with_retry(client, model: str, prompt: str, max_attempts: int = 5):
     """
-    Wraps a Gemini generate_content call with retry + backoff.
-    We're seeing intermittent forcibly-closed connections on rapid
-    back-to-back calls, so retry with a short pause rather than crashing
-    the whole run over a transient network blip.
+    Wraps a Gemini generate_content call with pacing + retry + backoff.
+    Paces every call globally to respect free-tier rate limits, and on
+    failure, respects Google's suggested retry delay (from 429 errors)
+    rather than guessing our own backoff.
     """
     last_error = None
     for attempt in range(1, max_attempts + 1):
+        _wait_for_gemini_turn()
         try:
             return client.models.generate_content(model=model, contents=prompt)
         except Exception as e:
             last_error = e
+            # If this was a quota error, Google tells us exactly how long
+            # to wait (e.g. "retryDelay": "38s") - use that instead of a
+            # fixed backoff so we don't hammer the API while still limited.
+            wait_seconds = 3 * attempt
+            match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", str(e))
+            if match:
+                wait_seconds = int(match.group(1)) + 1  # +1s buffer
             print(f"  (Gemini call failed, attempt {attempt}/{max_attempts}: {e})")
-            time.sleep(3 * attempt)  # 3s, 6s, 9s, 12s, 15s backoff
+            print(f"  (waiting {wait_seconds}s before retry)")
+            time.sleep(wait_seconds)
     raise last_error
 
 # --- Step 1: Parallel research call -----------------------------------
@@ -137,7 +171,32 @@ Write a short risk note (3-5 sentences) covering:
     response = call_gemini_with_retry(client, "gemini-3.6-flash", prompt)
     return response.text
 
-# --- Sample script snippet (swap this for a real one later) -------------
+# --- Script input --------------------------------------------------------
+
+def load_script_text() -> str:
+    """
+    Loads the script text to analyze.
+
+    Usage:
+        python main.py                  -> uses the built-in sample script
+        python main.py path/to/file.txt -> reads and analyzes that file
+
+    Keeping this simple on purpose: plain .txt input only for now. Real
+    script formats (.pdf, .fdx) can come later once the core extraction
+    is validated against messier real-world text.
+    """
+    if len(sys.argv) > 1:
+        script_path = sys.argv[1]
+        if not os.path.exists(script_path):
+            print(f"Error: file not found: {script_path}")
+            sys.exit(1)
+        with open(script_path, "r", encoding="utf-8") as f:
+            print(f"Loaded script from: {script_path}\n")
+            return f.read()
+    else:
+        print("No file provided, using built-in sample script.\n")
+        print("(Tip: run `python main.py path/to/script.txt` to analyze your own script.)\n")
+        return SAMPLE_SCRIPT
 
 SAMPLE_SCRIPT = """
 INT. COFFEE SHOP - DAY
@@ -172,8 +231,10 @@ def process_mention(mention: str) -> tuple[str, str]:
 # --- Main pipeline --------------------------------------------------------
 
 if __name__ == "__main__":
+    script_text = load_script_text()
+
     print("[1/2] Extracting clearance-relevant mentions from script...\n")
-    mentions = extract_mentions(SAMPLE_SCRIPT)
+    mentions = extract_mentions(script_text)
 
     if not mentions:
         print("No clearance-relevant mentions found.")
