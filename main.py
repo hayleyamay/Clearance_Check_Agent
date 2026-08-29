@@ -7,11 +7,13 @@ relevant mentions itself, then run each one through the pipeline and produce
 one combined report.
 """
 
+import json
 import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from threading import Semaphore
 from dotenv import load_dotenv
 from parallel import Parallel
@@ -217,16 +219,16 @@ She takes a sip from a Starbucks cup.
 
 # --- Per-mention pipeline (runs concurrently, one per mention) ---------
 
-def process_mention(mention: str) -> tuple[str, str]:
+def process_mention(mention: str) -> tuple[str, str, str]:
     """
     Runs the full research -> synthesis pipeline for a single mention.
-    Returns (mention, risk_note). Designed to be called from a thread pool
-    so multiple mentions can be in-flight at once instead of waiting on
-    each other sequentially.
+    Returns (mention, findings, risk_note) - we keep the raw findings too
+    so they can be saved separately for transparency/verification, even
+    though the clean risk_note is what's meant for end users to read.
     """
     findings = research_clearance_risk(mention)
     risk_note = summarize_risk(mention, findings)
-    return mention, risk_note
+    return mention, findings, risk_note
 
 # --- Main pipeline --------------------------------------------------------
 
@@ -243,18 +245,18 @@ if __name__ == "__main__":
         print(f"[2/2] Processing all mentions (up to {MAX_CONCURRENT_MENTIONS} at a time)...\n")
 
         start_time = time.time()
-        results = {}  # mention -> risk_note, filled in as each completes
+        results = {}  # mention -> {"findings": ..., "risk_note": ...}
 
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_MENTIONS) as executor:
             futures = {executor.submit(process_mention, m): m for m in mentions}
             for future in as_completed(futures):
                 mention = futures[future]
                 try:
-                    _, risk_note = future.result()
-                    results[mention] = risk_note
+                    _, findings, risk_note = future.result()
+                    results[mention] = {"findings": findings, "risk_note": risk_note}
                     print(f"  Done: {mention}")
                 except Exception as e:
-                    results[mention] = f"ERROR processing this mention: {e}"
+                    results[mention] = {"findings": "", "risk_note": f"ERROR processing this mention: {e}"}
                     print(f"  Failed: {mention} ({e})")
 
         elapsed = time.time() - start_time
@@ -262,9 +264,35 @@ if __name__ == "__main__":
 
         # Preserve original script order in the final report, even though
         # they may have finished out of order.
-        report = [f"=== {m} ===\n{results[m]}\n" for m in mentions]
+        report = [f"=== {m} ===\n{results[m]['risk_note']}\n" for m in mentions]
 
         print("=" * 60)
         print("CLEARANCE PRE-CHECK REPORT")
         print("=" * 60 + "\n")
         print("\n".join(report))
+
+        # --- Save two output files ---------------------------------------
+        # 1. clean report: mention -> risk_note only. This is what a real
+        #    user (or the future web UI) actually wants to read.
+        # 2. detailed report: mention -> findings + risk_note. Kept for
+        #    transparency - lets judges/reviewers verify Parallel actually
+        #    did real research grounding each note, not just decoration.
+
+        os.makedirs("output", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        clean_report = {m: results[m]["risk_note"] for m in mentions}
+        clean_path = f"output/clearance_report_{timestamp}.json"
+        with open(clean_path, "w", encoding="utf-8") as f:
+            json.dump(clean_report, f, indent=2, ensure_ascii=False)
+
+        detailed_report = {
+            m: {"findings": results[m]["findings"], "risk_note": results[m]["risk_note"]}
+            for m in mentions
+        }
+        detailed_path = f"output/clearance_report_detailed_{timestamp}.json"
+        with open(detailed_path, "w", encoding="utf-8") as f:
+            json.dump(detailed_report, f, indent=2, ensure_ascii=False)
+
+        print(f"\nSaved clean report to: {clean_path}")
+        print(f"Saved detailed report (with research findings) to: {detailed_path}")
