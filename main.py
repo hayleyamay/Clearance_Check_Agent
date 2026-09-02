@@ -22,7 +22,27 @@ from google import genai
 load_dotenv()
 
 PARALLEL_API_KEY = os.environ["PARALLEL_API_KEY"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+# Google Cloud project + region for the Gemini Enterprise Agent Platform
+# (formerly "Vertex AI"). No API key needed here - authentication comes
+# from Application Default Credentials (set up via `gcloud auth
+# application-default login`), tied to your Google Cloud project.
+GOOGLE_CLOUD_PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]
+GOOGLE_CLOUD_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+
+
+def get_gemini_client():
+    """
+    Creates a Gemini client backed by Google Cloud (Gemini Enterprise Agent
+    Platform - the current name for what used to be called Vertex AI),
+    authenticated via Application Default Credentials rather than an API
+    key. Centralized here so every call site stays consistent.
+    """
+    return genai.Client(
+        enterprise=True,
+        project=GOOGLE_CLOUD_PROJECT,
+        location=GOOGLE_CLOUD_LOCATION,
+    )
 
 # How many mentions to process at once. Kept low because the Gemini free
 # tier only allows 5 requests/minute for this model - going higher just
@@ -118,7 +138,7 @@ def extract_mentions(script_text: str) -> list[str]:
     need clearance: real brands/products, real people, song titles, or
     specific real-world locations. Returns a plain list of short strings.
     """
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = get_gemini_client()
 
     prompt = f"""You are helping a production legal team scan a script for
 anything that might need rights clearance before filming or release.
@@ -135,7 +155,7 @@ Respond with ONLY a plain list, one item per line, nothing else.
 If nothing needs clearance, respond with exactly: NONE
 """
 
-    response = call_gemini_with_retry(client, "gemini-3.6-flash", prompt)
+    response = call_gemini_with_retry(client, "gemini-3.5-flash", prompt)
     text = response.text.strip()
     if text == "NONE" or not text:
         return []
@@ -155,7 +175,7 @@ def summarize_risk(mention: str, research_findings) -> str:
     Feed Parallel's raw findings into Gemini and get back a structured
     plain-English risk note.
     """
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = get_gemini_client()
 
     prompt = f"""You are helping a production legal team do a first-pass
 clearance check on a script. Below is web research about a mention of
@@ -170,7 +190,7 @@ Write a short risk note (3-5 sentences) covering:
 3. A recommended next step (e.g. "consult legal", "likely fine to use", "seek licensing")
 """
 
-    response = call_gemini_with_retry(client, "gemini-3.6-flash", prompt)
+    response = call_gemini_with_retry(client, "gemini-3.5-flash", prompt)
     return response.text
 
 # --- Script input --------------------------------------------------------
