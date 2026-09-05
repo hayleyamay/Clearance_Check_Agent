@@ -26,7 +26,7 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from agent_tools import research_clearance_risk
-from main import get_gemini_client, call_gemini_with_retry
+from main import get_gemini_client, call_gemini_with_retry, load_script_text
 
 load_dotenv()
 
@@ -222,25 +222,10 @@ Write a short risk note (3-5 sentences) covering:
 if __name__ == "__main__":
     import asyncio
 
-    SAMPLE_SCRIPT = """
-    INT. COFFEE SHOP - DAY
+    script_text = load_script_text()
 
-    MAYA sits at a corner table, scrolling on her iPhone. She's playing
-    "Bohemian Rhapsody" through her earbuds, loud enough that JAKE can hear
-    it from across the room.
-
-    JAKE
-    Is that Queen? Nice.
-
-    MAYA
-    (not looking up)
-    Yeah. Anyway - did you see what Elon Musk tweeted this morning?
-
-    She takes a sip from a Starbucks cup.
-    """
-
-    print("Running Clearance Check Agent on sample script...\n")
-    result = asyncio.run(run_clearance_check(SAMPLE_SCRIPT))
+    print("Running Clearance Check Agent...\n")
+    result = asyncio.run(run_clearance_check(script_text))
     for entry in result:
         print(json.dumps(entry, indent=2))
 
